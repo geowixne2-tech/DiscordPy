@@ -1,0 +1,346 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+from datetime import datetime
+import asyncio
+import sqlite3
+import os
+
+
+# ============== КОНФИГ ==============
+
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+DATABASE_PATH = "broadcast.db"
+
+COLORS = {
+    "success": 0x2ECC71,
+    "error": 0xE74C3C,
+    "info": 0x3498DB,
+    "warning": 0xF39C12,
+    "broadcast": 0x9B59B6
+}
+
+E = {
+    "broadcast": "📢", "success": "✅", "error": "❌",
+    "chat": "💬", "settings": "⚙️", "list": "📋",
+    "arrow": "➜", "star": "✨", "rocket": "🚀",
+    "shield": "🛡️", "trash": "🗑️", "info": "📖"
+}
+
+
+# ============== БОТ ==============
+
+class BroadcastBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.db = None
+
+    # -------- БАЗА ДАННЫХ --------
+
+    def init_db(self):
+        self.db = sqlite3.connect(DATABASE_PATH)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS excluded_channels (
+                guild_id INTEGER,
+                channel_id INTEGER,
+                channel_name TEXT,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+        self.db.commit()
+
+    def add_excluded(self, guild_id: int, channel_id: int, name: str):
+        self.db.execute(
+            "INSERT OR REPLACE INTO excluded_channels VALUES (?, ?, ?)",
+            (guild_id, channel_id, name)
+        )
+        self.db.commit()
+
+    def remove_excluded(self, guild_id: int, channel_id: int):
+        self.db.execute(
+            "DELETE FROM excluded_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        )
+        self.db.commit()
+
+    def get_excluded(self, guild_id: int) -> list:
+        cur = self.db.execute(
+            "SELECT channel_id, channel_name FROM excluded_channels WHERE guild_id=?",
+            (guild_id,)
+        )
+        return cur.fetchall()
+
+    def is_excluded(self, guild_id: int, channel_id: int) -> bool:
+        cur = self.db.execute(
+            "SELECT 1 FROM excluded_channels WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id)
+        )
+        return cur.fetchone() is not None
+
+    def clear_excluded(self, guild_id: int) -> int:
+        cur = self.db.execute(
+            "SELECT COUNT(*) FROM excluded_channels WHERE guild_id=?",
+            (guild_id,)
+        )
+        count = cur.fetchone()[0]
+        self.db.execute(
+            "DELETE FROM excluded_channels WHERE guild_id=?",
+            (guild_id,)
+        )
+        self.db.commit()
+        return count
+
+    # -------- EMBED КОНСТРУКТОР --------
+
+    def embed(self, style: str, title: str, desc: str, fields: list = None, footer: str = None, icon_url: str = None) -> discord.Embed:
+        em = discord.Embed(
+            title=title,
+            description=desc,
+            color=COLORS.get(style, COLORS["info"]),
+            timestamp=datetime.utcnow()
+        )
+        if fields:
+            for f in fields:
+                em.add_field(name=f[0], value=f[1], inline=f[2] if len(f) > 2 else True)
+        em.set_footer(
+            text=footer or "Система рассылки",
+            icon_url=icon_url
+        )
+        return em
+
+    def broadcast_embed(self, message: str, author: discord.Member, btype: str) -> discord.Embed:
+        title = f"{E['broadcast']} Глобальное Объявление" if btype == "all" else f"{E['chat']} Объявление"
+        em = discord.Embed(
+            title=title,
+            color=COLORS["broadcast"],
+            timestamp=datetime.utcnow()
+        )
+        em.description = f">>> {message}"
+        em.add_field(name="\u200b", value="─────────────────────────", inline=False)
+        em.add_field(
+            name=f"{E['star']} Важная информация",
+            value="Пожалуйста, ознакомьтесь с сообщением выше.",
+            inline=False
+        )
+        em.set_footer(
+            text="Система рассылки",
+            icon_url=author.display_avatar.url if author.display_avatar else None
+        )
+        if author.guild.icon:
+            em.set_thumbnail(url=author.guild.icon.url)
+        return em
+
+    # -------- РАССЫЛКА --------
+
+    async def do_broadcast(self, interaction: discord.Interaction, message: str, btype: str):
+        author = interaction.user
+        guild = interaction.guild
+        be = self.broadcast_embed(message, author, btype)
+
+        if btype == "chat":
+            try:
+                await interaction.channel.send(embed=be)
+                res = self.embed(
+                    "success",
+                    f"{E['success']} Отправлено!",
+                    f"Объявление опубликовано в {interaction.channel.mention}"
+                )
+                await interaction.followup.send(embed=res, ephemeral=True)
+            except Exception as ex:
+                res = self.embed("error", f"{E['error']} Ошибка", f"```{ex}```")
+                await interaction.followup.send(embed=res, ephemeral=True)
+            return
+
+        sent, failed, skipped = 0, 0, 0
+        channels = [
+            ch for ch in guild.text_channels
+            if ch.permissions_for(guild.me).send_messages
+        ]
+
+        for ch in channels:
+            if self.is_excluded(guild.id, ch.id):
+                skipped += 1
+                continue
+            try:
+                await ch.send(embed=be)
+                sent += 1
+                await asyncio.sleep(0.5)
+            except Exception:
+                failed += 1
+
+        res = self.embed(
+            "success",
+            f"{E['success']} Рассылка завершена!",
+            f"Сервер **{guild.name}**",
+            fields=[
+                (f"{E['success']} Отправлено", f"```{sent}```", True),
+                (f"{E['error']} Ошибки", f"```{failed}```", True),
+                ("⏭️ Пропущено", f"```{skipped}```", True),
+            ]
+        )
+        await interaction.followup.send(embed=res, ephemeral=True)
+
+    # -------- СОБЫТИЯ --------
+
+    async def setup_hook(self):
+        self.init_db()
+        self.tree.add_command(cmd_all)
+        self.tree.add_command(cmd_chat)
+        self.tree.add_command(cmd_listchat)
+        self.tree.add_command(cmd_help)
+        await self.tree.sync()
+        print(f"{E['success']} Команды синхронизированы")
+
+    async def on_ready(self):
+        print(f"{'═' * 45}")
+        print(f"  {E['rocket']} Бот запущен: {self.user}")
+        print(f"  {E['list']} Серверов: {len(self.guilds)}")
+        print(f"{'═' * 45}")
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="за рассылками 📢"
+            )
+        )
+
+
+bot = BroadcastBot()
+
+
+# ============== МОДАЛЬНОЕ ОКНО ==============
+
+class BroadcastModal(discord.ui.Modal, title="📢 Создать рассылку"):
+    msg = discord.ui.TextInput(
+        label="Текст сообщения",
+        style=discord.TextStyle.paragraph,
+        placeholder="Введите текст объявления...",
+        required=True,
+        max_length=2000
+    )
+
+    def __init__(self, btype: str):
+        super().__init__()
+        self.btype = btype
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await bot.do_broadcast(interaction, self.msg.value, self.btype)
+
+
+# ============== VIEW ДЛЯ LISTCHAT ==============
+
+class ExcludeView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, excluded: list):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.excluded_ids = [ch[0] for ch in excluded]
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        placeholder="Выберите каналы...",
+        min_values=1,
+        max_values=15,
+        channel_types=[discord.ChannelType.text]
+    )
+    async def select_channels(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        await interaction.response.defer(ephemeral=True)
+        added, removed = [], []
+
+        for ch in select.values:
+            if ch.id in self.excluded_ids:
+                bot.remove_excluded(self.guild.id, ch.id)
+                self.excluded_ids.remove(ch.id)
+                removed.append(ch.mention)
+            else:
+                bot.add_excluded(self.guild.id, ch.id, ch.name)
+                self.excluded_ids.append(ch.id)
+                added.append(ch.mention)
+
+        parts = []
+        if added:
+            items = "\n".join(f"{E['arrow']} {c}" for c in added)
+            parts.append(f"**{E['error']} Исключены:**\n{items}")
+        if removed:
+            items = "\n".join(f"{E['arrow']} {c}" for c in removed)
+            parts.append(f"**{E['success']} Возвращены:**\n{items}")
+
+        res = bot.embed("success", f"{E['success']} Обновлено!", "\n\n".join(parts))
+        await interaction.followup.send(embed=res, ephemeral=True)
+
+    @discord.ui.button(label="Показать исключённые", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def show_list(self, interaction: discord.Interaction, button: discord.ui.Button):
+        excluded = bot.get_excluded(self.guild.id)
+        if not excluded:
+            em = bot.embed("info", f"{E['list']} Пусто", "Все каналы участвуют в рассылке.")
+        else:
+            lines = "\n".join(f"{E['arrow']} <#{c[0]}> — `{c[1]}`" for c in excluded)
+            em = bot.embed("info", f"{E['list']} Исключения ({len(excluded)})", lines)
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
+    @discord.ui.button(label="Очистить всё", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        count = bot.clear_excluded(self.guild.id)
+        self.excluded_ids.clear()
+        if count == 0:
+            em = bot.embed("info", f"{E['info']} Нечего очищать", "Список и так пуст.")
+        else:
+            em = bot.embed("success", f"{E['trash']} Очищено!", f"Удалено **{count}** каналов из исключений.")
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+# ============== КОМАНДЫ ==============
+
+@app_commands.command(name="all", description="📢 Рассылка во все каналы сервера")
+@app_commands.default_permissions(administrator=True)
+async def cmd_all(interaction: discord.Interaction):
+    await interaction.response.send_modal(BroadcastModal("all"))
+
+
+@app_commands.command(name="chat", description="💬 Объявление в текущий канал")
+@app_commands.default_permissions(manage_messages=True)
+async def cmd_chat(interaction: discord.Interaction):
+    await interaction.response.send_modal(BroadcastModal("chat"))
+
+
+@app_commands.command(name="listchat", description="⚙️ Настройка исключений рассылки")
+@app_commands.default_permissions(administrator=True)
+async def cmd_listchat(interaction: discord.Interaction):
+    excluded = bot.get_excluded(interaction.guild.id)
+    em = bot.embed(
+        "info",
+        f"{E['settings']} Управление каналами",
+        f"Выберите каналы в меню ниже.\n"
+        f"• Если канал **не исключён** — он будет исключён\n"
+        f"• Если канал **уже исключён** — он вернётся в рассылку\n\n"
+        f"{E['list']} Сейчас исключено: **{len(excluded)}**"
+    )
+    view = ExcludeView(interaction.guild, excluded)
+    await interaction.response.send_message(embed=em, view=view, ephemeral=True)
+
+
+@app_commands.command(name="help", description="📖 Справка по командам")
+async def cmd_help(interaction: discord.Interaction):
+    em = bot.embed(
+        "info",
+        f"{E['info']} Справка",
+        f"**Доступные команды:**\n\n"
+        f"{E['broadcast']} `/all` — рассылка во **все** каналы\n"
+        f"╰ *Требуется: Администратор*\n\n"
+        f"{E['chat']} `/chat` — объявление в **текущий** канал\n"
+        f"╰ *Требуется: Управление сообщениями*\n\n"
+        f"{E['settings']} `/listchat` — настройка **исключений**\n"
+        f"╰ *Требуется: Администратор*\n\n"
+        f"─────────────────────────\n"
+        f"{E['star']} Все сообщения отправляются в виде красивых embed."
+    )
+    await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+# ============== ЗАПУСК ==============
+
+if __name__ == "__main__":
+    print(f"{E['rocket']} Запуск...")
+    bot.run(BOT_TOKEN)
